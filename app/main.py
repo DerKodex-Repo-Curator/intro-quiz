@@ -379,13 +379,18 @@ class Hub:
         snap["next_host"] = self.next_host  # shown on the finished screen
         snap["game_no"] = self.games_started
         dead = []
-        for ws in self.sockets:
+        for ws in list(self.sockets):   # snapshot: a disconnect can mutate mid-send
             try:
                 await ws.send_json(snap)
             except Exception:  # noqa: BLE001
                 dead.append(ws)
-        for ws in dead:
-            self.sockets.remove(ws)
+        if dead:
+            # Rebuild rather than remove() one by one. This awaits inside the send
+            # loop, so the disconnect handler (or another broadcast) can already have
+            # dropped the same socket, and list.remove() would then raise ValueError
+            # straight out into whatever was driving the game (#77).
+            dead_set = set(dead)
+            self.sockets = [w for w in self.sockets if w not in dead_set]
 
     def cancel_deadline(self):
         if self.deadline_task and not self.deadline_task.done():
@@ -461,13 +466,16 @@ async def reveal_tf_after_pause(game_obj, tf_index: int):
     Bails quietly if the game moved on meanwhile (host force-next, abort,
     new game) — advance_break stays the single reveal path either way."""
     await asyncio.sleep(TF_REVEAL_PAUSE_S)
-    g = hub.game
-    if g is not game_obj or g.phase != "break" or g.tf_index != tf_index:
-        return
-    if g.tf_qs[tf_index]["revealed"]:
-        return  # the host already forced it
-    g.advance_break()
-    await hub.broadcast()
+    # Under the lock, like every other broadcast site: the guards below only hold off
+    # the host's force-next if they are checked on the same side of it (#77).
+    async with hub.lock:
+        g = hub.game
+        if g is not game_obj or g.phase != "break" or g.tf_index != tf_index:
+            return
+        if g.tf_qs[tf_index]["revealed"]:
+            return  # the host already forced it
+        g.advance_break()
+        await hub.broadcast()
 
 
 @app.websocket("/ws")
